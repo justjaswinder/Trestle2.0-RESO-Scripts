@@ -70,14 +70,23 @@ function createMetaData(metaDataTableName, field) {
     } else {
       insertingData = `'${field.attributes.Name}', 'ENUM'`;
     }
+    const insertMetaDataQuery = `
+      INSERT INTO ${metaDataTableName} (field, type)
+      SELECT '${field.attributes.Name}', '${relation ? relation.sql : "ENUM"}'
+      FROM dual
+      WHERE NOT EXISTS (
+          SELECT 1
+          FROM ${metaDataTableName}
+          WHERE field = '${field.attributes.Name}'
+      );
+    `;
+    db.query(insertMetaDataQuery, (err, result) => {
+      if (err) throw err;
+      // console.log("data inserted");
+    });
   } else return false;
 
-  let insertMetaDataQuery = `INSERT INTO ${metaDataTableName} (field, type) VALUES (${insertingData})`;
 
-  db.query(insertMetaDataQuery, (err, result) => {
-    if (err) throw err;
-    // console.log("data inserted");
-  });
 }
 
 async function createMetaDataTable(metadata) {
@@ -92,12 +101,12 @@ async function createMetaDataTable(metadata) {
         createTables(schema);
       });
     } else {
-      console.error(
+      console.log(
         "Expected data structure is not met in the provided metadata."
       );
     }
   } catch (e) {
-    console.error("Failed to parse metadata or process data:", e);
+    console.log("Failed to parse metadata or process data:", e);
   }
 }
 
@@ -124,7 +133,7 @@ async function saveDataHandle(element) {
 
         db.query(getFieldIdQuery, (err, result) => {
           if (err) {
-            console.error(err);
+            console.log(err);
             return;
           }
 
@@ -160,21 +169,29 @@ async function saveDataHandle(element) {
                 .then((response) => {
                   const params = {
                     Bucket: process.env.AWS_S3_BUCKET_NAME,
-                    Key: `uploads/${Date.now()}-${propertyItem[propertyKey].split('/').pop()}`,
+                    Key: `uploads/${Date.now()}-${propertyItem[propertyKey].split('/').pop()}.${propertyItem["MediaType"]}`,
                     Body: response.data
                   };
 
                   s3.upload(params).promise()
                     .then(data => {
                       console.log('Upload successful:', data.Location);
+                      const values = [key, fieldId, data.Location];
+
+                      db.query(insertOrUpdatePropertyData, values, (err, result) => {
+                        if (err) {
+                          console.log("err");
+                          return;
+                        }
+                      });
                     })
                     .catch(err => {
-                      console.error("Error during S3 upload:", err);
+                      console.log("Error during S3 upload:", err);
                     });
                   // Assume you have the S3 upload logic here:
                   // You might want to set up AWS SDK or similar to handle it.
                 })
-                .catch(console.error);
+                .catch(console.log);
             } catch(err) {
               console.log("Error processing propertyKey:")
             }
@@ -184,18 +201,9 @@ async function saveDataHandle(element) {
 
             db.query(insertOrUpdatePropertyData, values, (err, result) => {
               if (err) {
-                console.error(err);
+                console.log(err);
                 return;
               }
-
-
-
-
-              // console.log("Data inserted or updated successfully.");
-
-
-
-
             });
           }
         });
@@ -270,22 +278,20 @@ async function fetchDataAndProcess() {
   let text = await originMetadata.text();
   let metadata = xmljs.xml2json(text, { compact: false, spaces: 4 });
 
-  // logger.info(metadata)
-
   //create metadata tables
   await createMetaDataTable(metadata);
   // Fetch data and save the data
   const elements = [
-    // "Property",
-    // "Member",
-    // "Teams",
-    // "TeamMembers",
-    // "Field",
-    // "Lookup",
-    // "Office",
-    // "OpenHouse",
-    // "PropertyRooms",
-    // "PropertyUnitTypes",
+    "Property",
+    "Member",
+    "Teams",
+    "TeamMembers",
+    "Field",
+    "Lookup",
+    "Office",
+    "OpenHouse",
+    "PropertyRooms",
+    "PropertyUnitTypes",
     "Media",
   ];
   await Promise.all(
@@ -297,11 +303,10 @@ async function fetchDataAndProcess() {
 
 // Schedule the tas k to run every 5 minutes
 // cron.schedule('*/1 * * * *', () => {
-//   console.log('Running data fetch every 1 minutes');
-//   fetchDataAndProcess();  // Call your function
+//    // Call your function  // Call your function
 // });
 
 app.listen(3000, () => {
   console.log("Server running on http://localhost:3000");
-  fetchDataAndProcess(); // Call your function
+  fetchDataAndProcess();
 });
