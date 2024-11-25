@@ -31,6 +31,19 @@ db.connect((error) => {
   console.log("Successfully connected to the database.");
 });
 
+let latestUpdatedTime;
+
+db.query('SELECT MAX(updated_date) AS LatestUpdate FROM latest_date', (error, results, fields) => {
+
+  console.log(results);
+
+  if(results == undefined) {
+    latestUpdatedTime = 0
+  } else {
+    latestUpdatedTime = new Date(results[0].LatestUpdate).getTime();
+  }
+});
+
 async function authenticate() {
   const trestleConfig = {
     client: {
@@ -118,106 +131,115 @@ async function saveDataHandle(element) {
   });
 
   let allProperty = await trestle
-    .get(element)
-    .query({ $top: 2 })
+    .get("https://api-prod.corelogic.com/trestle/odata/Property?$expand=Media&replication=true")
+    .query()
     .catch((e) => console.log(e));
 
-  if (allProperty.value)
-    allProperty.value.forEach((propertyItem) => {
-      const propertyKeys = Object.keys(propertyItem);
+  let nextLink = allProperty["@odata.nextLink"]
+  while(nextLink) {
+    if (!allProperty.value) return;
 
-      propertyKeys.forEach((propertyKey) => {
-        let getFieldIdQuery = `SELECT id FROM ${element}_metadata WHERE field = "${propertyKey}"`;
+    allProperty = await trestle
+      .get(nextLink)
+      .query()
+      .catch((e) => console.log(e));
+    // Collect all unique property keys from all items
+    const allPropertyKeys = [...new Set(allProperty.value.flatMap(Object.keys))];
 
-        db.query(getFieldIdQuery, (err, result) => {
-          if (err) {
-            console.log(err);
-            return;
+    // Fetch all field IDs at once
+    const getFieldIdQuery = `SELECT id, field FROM ${element}_metadata WHERE field IN (${allPropertyKeys.map(key => `"${key}"`).join(', ')})`;
+    const metadataResults = await new Promise((resolve, reject) => {
+      db.query(getFieldIdQuery, (err, result) => {
+        if (err) return reject(err);
+        resolve(result.reduce((acc, item) => ({ ...acc, [item.field]: item.id }), {}));
+      });
+    });
+
+    let bulkInsertValues = [];
+    let bulkInsertMedias = []
+    for (const propertyItem of allProperty.value) {
+      const primaryKey = propertyItem[`ListingKey`];
+
+      if(new Date(propertyItem['ModificationTimestamp']).getTime() < latestUpdatedTime) continue;
+      for (let propertyKey of Object.keys(propertyItem)) {
+        let fieldId = metadataResults[propertyKey];
+        if (!fieldId || !propertyItem[propertyKey] || propertyKey == "Media") continue;
+        bulkInsertValues.push([primaryKey, fieldId, propertyItem[propertyKey]]);
+      }
+
+      const allMediaKeys = [...new Set(propertyItem.Media.flatMap(Object.keys))];
+
+      const getMediaFieldIdQuery = `SELECT id, field FROM media_metadata WHERE field IN (${allMediaKeys.map(key => `"${key}"`).join(', ')})`;
+      const mediaMetadataResults = await new Promise((resolve, reject) => {
+        db.query(getMediaFieldIdQuery, (err, result) => {
+          if (err) return reject(err);
+          resolve(result.reduce((acc, item) => ({ ...acc, [item.field]: item.id }), {}));
+        });
+      });
+      for(const media of propertyItem.Media) {
+        if(new Date(media['MediaModificationTimestamp']).getTime() < latestUpdatedTime) continue;
+        let uploadedUrl = await handleMediaUpload(media, primaryKey);
+        for (let mediaKey of Object.keys(media)) {
+          let mediaFieldId = mediaMetadataResults[mediaKey];
+          if(mediaKey == "MediaURL") {
+            bulkInsertMedias.push([primaryKey, mediaFieldId, uploadedUrl])
           }
-
-          if (!result.length) {
-            console.log("No field ID found, skipping insertion.");
-            return;
-          }
-
-          const fieldId = result[0].id;
-          if (!propertyItem[propertyKey]) {
-            return;
-          }
-
-          const insertOrUpdatePropertyData = `
-            INSERT INTO ${element} (primary_key, field_id, value)
-            VALUES (?, ?, ?)
+          bulkInsertMedias.push([primaryKey, mediaFieldId, media[mediaKey]])
+        }
+        let insertMediaQuery = `
+          INSERT INTO media (primary_key, field_id, value)
+            VALUES ?
             ON DUPLICATE KEY UPDATE
               value = CASE
                 WHEN primary_key != VALUES(primary_key) THEN VALUES(value)
                 ELSE value
               END;
-          `;
-
-          const key = propertyItem[`${element}Key`];
-
-          if (
-            element === "Media" &&
-            propertyKey === "MediaURL" &&
-            propertyItem[propertyKey]
-          ) {
-            try {
-              axios({
-                url: propertyItem[propertyKey],
-                method: "GET",
-                responseType: "stream",
-              })
-                .then((response) => {
-                  const params = {
-                    Bucket: process.env.AWS_S3_BUCKET_NAME,
-                    Key: `uploads/${Date.now()}-${propertyItem[propertyKey]
-                      .split("/")
-                      .pop()}.${propertyItem["MediaType"]}`,
-                    Body: response.data,
-                  };
-
-                  s3.upload(params)
-                    .promise()
-                    .then((data) => {
-                      console.log("Upload successful:", data.Location);
-                      const values = [key, fieldId, data.Location];
-
-                      db.query(
-                        insertOrUpdatePropertyData,
-                        values,
-                        (err, result) => {
-                          if (err) {
-                            console.log("err");
-                            return;
-                          }
-                        }
-                      );
-                    })
-                    .catch((err) => {
-                      console.log("Error during S3 upload:", err);
-                    });
-                  // Assume you have the S3 upload logic here:
-                  // You might want to set up AWS SDK or similar to handle it.
-                })
-                .catch(console.log);
-            } catch (err) {
-              console.log("Error processing propertyKey:");
-            }
-          } else {
-            const values = [key, fieldId, propertyItem[propertyKey]];
-
-            db.query(insertOrUpdatePropertyData, values, (err, result) => {
-              if (err) {
-                console.log(err);
-                return;
-              }
-            });
-          }
+        `
+        await new Promise((resolve, reject) => {
+          db.query(insertMediaQuery, [bulkInsertMedias], (err, result) => err ? reject(err) : resolve(result));
         });
-      });
-      console.log("data is saved");
+      }
+
+      if (bulkInsertValues.length > 0) {
+        const insertQuery = `
+          INSERT INTO ${element} (primary_key, field_id, value)
+          VALUES ?
+          ON DUPLICATE KEY UPDATE
+            value = CASE
+              WHEN primary_key != VALUES(primary_key) THEN VALUES(value)
+              ELSE value
+            END;
+        `;
+        await new Promise((resolve, reject) => {
+          db.query(insertQuery, [bulkInsertValues], (err, result) => err ? reject(err) : resolve(result));
+        });
+      }
+    }
+  }
+}
+
+async function handleMediaUpload(media, primaryKey) {
+  try {
+    const response = await axios({
+      url: media["MediaURL"],
+      method: "GET",
+      responseType: "stream",
     });
+    const fileExtension = media["MediaType"];
+    const s3Key = `uploads/images/2024/${primaryKey}/${media["MediaKey"].split('/').pop()}.${fileExtension}`;
+
+    const params = {
+      Bucket: process.env.AWS_S3_BUCKET_NAME,
+      Key: s3Key,
+      Body: response.data,
+    };
+
+    const uploadResult = await s3.upload(params).promise();
+    console.log("Upload successful:", uploadResult.Location);
+    return uploadResult.Location;
+  } catch (err) {
+    console.error("Error during S3 upload:", err);
+  }
 }
 
 async function createTables(schema) {
@@ -246,7 +268,9 @@ async function createTables(schema) {
           primary_key VARCHAR(100),
           field_id INT,
           value VARCHAR(250),
-          FOREIGN KEY (field_id) REFERENCES ${metaDataTableName}(id)
+          FOREIGN KEY (field_id) REFERENCES ${metaDataTableName}(id),
+          is_deleted BOOLEAN,
+          is_updated BOOLEAN
         );
       `;
 
@@ -363,7 +387,7 @@ async function fetchDataAndProcess() {
     "OpenHouse",
     "PropertyRooms",
     "PropertyUnitTypes",
-    "Media",
+    // "Media",
   ];
   await Promise.all(
     elements.map(async (element) => {
@@ -372,12 +396,46 @@ async function fetchDataAndProcess() {
   );
 }
 
+function startScript () {
+  fetchDataAndProcess();
+  latestUpdatedTime =new Date()
+
+  // Format date to MySQL DATETIME format
+  const mysqlDateTime = latestUpdatedTime.toISOString().slice(0, 19).replace('T', ' ');
+
+  let LatestUpdatedDateDBCreationQuery = `
+    CREATE TABLE IF NOT EXISTS \`latest_date\` (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      updated_date DATETIME
+    );
+  `
+  db.query(LatestUpdatedDateDBCreationQuery, (err, result) => {
+    if (err) throw err;
+  });
+
+  db.query('SELECT * FROM `latest_date` WHERE `id` = "1"', function (error, results, fields) {
+    if (results.length !== 0) {
+      var sql = `UPDATE latest_date SET updated_date = ? WHERE id = 1`;
+      var params = [mysqlDateTime];  // Parameters used in the SQL query
+    } else {
+        var sql = `INSERT INTO latest_date (updated_date) VALUES (?)`;
+        var params = [mysqlDateTime];
+    }
+
+    // Use these in your query call
+    db.query(sql, params, (err, result) => {
+        if (err) throw err;
+        console.log('Operation successful');
+    });
+  });
+}
+
 // Schedule the tas k to run every 5 minutes
-// cron.schedule('*/1 * * * *', () => {
-//    // Call your function  // Call your function
-// });
+cron.schedule('*/10 * * * *', () => {
+  startScript()
+});
 
 app.listen(3000, () => {
   console.log("Server running on http://localhost:3000");
-  fetchDataAndProcess();
+  startScript()
 });
