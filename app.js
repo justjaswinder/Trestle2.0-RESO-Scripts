@@ -122,99 +122,163 @@ async function createMetaDataTable(metadata) {
 }
 
 async function saveDataHandle(element) {
-  const accessToken = await authenticate();
-  const trestle = odata.o(process.env.API_URL, {
-    headers: {
-      Authorization: "Bearer " + accessToken.token.access_token,
-    },
-    fragment: "",
-  });
+  try {
 
-  let allProperty = await trestle
-    .get("https://api-prod.corelogic.com/trestle/odata/Property?$expand=Media&replication=true")
-    .query()
-    .catch((e) => console.log(e));
-
-  let nextLink = allProperty["@odata.nextLink"]
-  while(nextLink) {
-    if (!allProperty.value) return;
-
-    allProperty = await trestle
-      .get(nextLink)
-      .query()
-      .catch((e) => console.log(e));
-    // Collect all unique property keys from all items
-    const allPropertyKeys = [...new Set(allProperty.value.flatMap(Object.keys))];
-
-    // Fetch all field IDs at once
-    const getFieldIdQuery = `SELECT id, field FROM ${element}_metadata WHERE field IN (${allPropertyKeys.map(key => `"${key}"`).join(', ')})`;
-    const metadataResults = await new Promise((resolve, reject) => {
-      db.query(getFieldIdQuery, (err, result) => {
-        if (err) return reject(err);
-        resolve(result.reduce((acc, item) => ({ ...acc, [item.field]: item.id }), {}));
-      });
+    const accessToken = await authenticate();
+    const trestle = odata.o(process.env.API_URL, {
+      headers: {
+        Authorization: "Bearer " + accessToken.token.access_token,
+      },
+      fragment: "",
     });
 
-    let bulkInsertValues = [];
-    let bulkInsertMedias = []
-    for (const propertyItem of allProperty.value) {
-      const primaryKey = propertyItem[`ListingKey`];
+    if(element == "Property") {
+      let allProperty = await trestle
+        .get("https://api-prod.corelogic.com/trestle/odata/Property?$expand=Media&replication=true")
+        .query()
+        .catch((e) => console.log(e));
 
-      if(new Date(propertyItem['ModificationTimestamp']).getTime() < latestUpdatedTime) continue;
-      for (let propertyKey of Object.keys(propertyItem)) {
-        let fieldId = metadataResults[propertyKey];
-        if (!fieldId || !propertyItem[propertyKey] || propertyKey == "Media") continue;
-        bulkInsertValues.push([primaryKey, fieldId, propertyItem[propertyKey]]);
-      }
+      let nextLink = allProperty["@odata.nextLink"]
 
-      const allMediaKeys = [...new Set(propertyItem.Media.flatMap(Object.keys))];
+      console.log("fetching data ...");
 
-      const getMediaFieldIdQuery = `SELECT id, field FROM media_metadata WHERE field IN (${allMediaKeys.map(key => `"${key}"`).join(', ')})`;
-      const mediaMetadataResults = await new Promise((resolve, reject) => {
-        db.query(getMediaFieldIdQuery, (err, result) => {
-          if (err) return reject(err);
-          resolve(result.reduce((acc, item) => ({ ...acc, [item.field]: item.id }), {}));
+      while(nextLink) {
+        if (!allProperty.value) return;
+
+        allProperty = await trestle
+          .get(nextLink)
+          .query()
+          .catch((e) => console.log(e));
+        // Collect all unique property keys from all items
+        const allPropertyKeys = [...new Set(allProperty.value.flatMap(Object.keys))];
+
+        // Fetch all field IDs at once
+        const getFieldIdQuery = `SELECT id, field FROM ${element}_metadata WHERE field IN (${allPropertyKeys.map(key => `"${key}"`).join(', ')})`;
+        const metadataResults = await new Promise((resolve, reject) => {
+          db.query(getFieldIdQuery, (err, result) => {
+            if (err) return reject(err);
+            resolve(result.reduce((acc, item) => ({ ...acc, [item.field]: item.id }), {}));
+          });
         });
-      });
-      for(const media of propertyItem.Media) {
-        if(new Date(media['MediaModificationTimestamp']).getTime() < latestUpdatedTime) continue;
-        let uploadedUrl = await handleMediaUpload(media, primaryKey);
-        for (let mediaKey of Object.keys(media)) {
-          let mediaFieldId = mediaMetadataResults[mediaKey];
-          if(mediaKey == "MediaURL") {
-            bulkInsertMedias.push([primaryKey, mediaFieldId, uploadedUrl])
+
+        let bulkInsertValues = [];
+        let bulkInsertMedias = []
+        for (const propertyItem of allProperty.value) {
+          const primaryKey = propertyItem[`ListingKey`];
+
+          if(new Date(propertyItem['ModificationTimestamp']).getTime() < latestUpdatedTime) continue;
+          for (let propertyKey of Object.keys(propertyItem)) {
+            let fieldId = metadataResults[propertyKey];
+            if (!fieldId || !propertyItem[propertyKey] || propertyKey == "Media") continue;
+            bulkInsertValues.push([primaryKey, fieldId, propertyItem[propertyKey]]);
           }
-          bulkInsertMedias.push([primaryKey, mediaFieldId, media[mediaKey]])
-        }
-        let insertMediaQuery = `
-          INSERT INTO media (primary_key, field_id, value)
-            VALUES ?
-            ON DUPLICATE KEY UPDATE
-              value = CASE
-                WHEN primary_key != VALUES(primary_key) THEN VALUES(value)
-                ELSE value
-              END;
-        `
-        await new Promise((resolve, reject) => {
-          db.query(insertMediaQuery, [bulkInsertMedias], (err, result) => err ? reject(err) : resolve(result));
-        });
-      }
 
-      if (bulkInsertValues.length > 0) {
-        const insertQuery = `
-          INSERT INTO ${element} (primary_key, field_id, value)
-          VALUES ?
-          ON DUPLICATE KEY UPDATE
-            value = CASE
-              WHEN primary_key != VALUES(primary_key) THEN VALUES(value)
-              ELSE value
-            END;
-        `;
-        await new Promise((resolve, reject) => {
-          db.query(insertQuery, [bulkInsertValues], (err, result) => err ? reject(err) : resolve(result));
-        });
+          const allMediaKeys = [...new Set(propertyItem.Media.flatMap(Object.keys))];
+
+          const getMediaFieldIdQuery = `SELECT id, field FROM media_metadata WHERE field IN (${allMediaKeys.map(key => `"${key}"`).join(', ')})`;
+          const mediaMetadataResults = await new Promise((resolve, reject) => {
+            db.query(getMediaFieldIdQuery, (err, result) => {
+              if (err) return reject(err);
+              resolve(result.reduce((acc, item) => ({ ...acc, [item.field]: item.id }), {}));
+            });
+          });
+          for(const media of propertyItem.Media) {
+            if(new Date(media['MediaModificationTimestamp']).getTime() < latestUpdatedTime) continue;
+            let uploadedUrl = await handleMediaUpload(media, primaryKey);
+            for (let mediaKey of Object.keys(media)) {
+              let mediaFieldId = mediaMetadataResults[mediaKey];
+              if(media[mediaKey] == null) continue;
+              if(mediaKey == "MediaURL") {
+                bulkInsertMedias.push([primaryKey, mediaFieldId, uploadedUrl])
+              } else {
+                bulkInsertMedias.push([primaryKey, mediaFieldId, media[mediaKey]])
+              }
+            }
+            let insertMediaQuery = `
+              INSERT INTO media (primary_key, field_id, value)
+                VALUES ?
+                ON DUPLICATE KEY UPDATE
+                  value = CASE
+                    WHEN primary_key != VALUES(primary_key) THEN VALUES(value)
+                    ELSE value
+                  END;
+            `
+            await new Promise((resolve, reject) => {
+              db.query(insertMediaQuery, [bulkInsertMedias], (err, result) => err ? reject(err) : resolve(result));
+            });
+          }
+
+          if (bulkInsertValues.length > 0) {
+            const insertQuery = `
+              INSERT INTO ${element} (primary_key, field_id, value)
+              VALUES ?
+              ON DUPLICATE KEY UPDATE
+                value = CASE
+                  WHEN primary_key != VALUES(primary_key) THEN VALUES(value)
+                  ELSE value
+                END;
+            `;
+            await new Promise((resolve, reject) => {
+              db.query(insertQuery, [bulkInsertValues], (err, result) => err ? reject(err) : resolve(result));
+            });
+          }
+        }
       }
+    } else {
+      let allProperty = await trestle
+      .get(element)
+      .query({$top: 2})
+      .catch((e) => console.log(e));
+
+      if (allProperty.value)
+        allProperty.value.forEach((propertyItem) => {
+          const propertyKeys = Object.keys(propertyItem);
+
+          propertyKeys.forEach((propertyKey) => {
+            let getFieldIdQuery = `SELECT id FROM ${element}_metadata WHERE field = "${propertyKey}"`;
+
+            db.query(getFieldIdQuery, (err, result) => {
+              if (err) {
+                console.log(err);
+                return;
+              }
+
+              if (!result.length) {
+                console.log("No field ID found, skipping insertion.");
+                return;
+              }
+
+              const fieldId = result[0].id;
+              if (!propertyItem[propertyKey]) {
+                return;
+              }
+
+              const insertOrUpdatePropertyData = `
+                INSERT INTO ${element} (primary_key, field_id, value)
+                VALUES (?, ?, ?)
+                ON DUPLICATE KEY UPDATE
+                  value = CASE
+                    WHEN primary_key != VALUES(primary_key) THEN VALUES(value)
+                    ELSE value
+                  END;
+              `;
+
+              const key = propertyItem[`${element}Key`];
+              const values = [key, fieldId, propertyItem[propertyKey]];
+              db.query(insertOrUpdatePropertyData, values, (err, result) => {
+                if (err) {
+                  console.log(err);
+                  return;
+                }
+              });
+
+            });
+          });
+        });
     }
+    console.log("Success");
+  } catch {
+    console.log("failed");
   }
 }
 
@@ -425,7 +489,6 @@ function startScript () {
     // Use these in your query call
     db.query(sql, params, (err, result) => {
         if (err) throw err;
-        console.log('Operation successful');
     });
   });
 }
