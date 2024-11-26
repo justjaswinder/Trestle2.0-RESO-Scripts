@@ -4,19 +4,23 @@ const app = express();
 const axios = require("axios");
 const cron = require("node-cron");
 const mysql = require("mysql");
-const AWS = require("aws-sdk");
 const odata = require("odata");
 const xmljs = require("xml-js");
-
+const { Upload } = require("@aws-sdk/lib-storage");
 require("dotenv").config();
 
-AWS.config.update({
-  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-  region: "us-east-1", // change to your region
+const { S3 } = require("@aws-sdk/client-s3");
+
+let isFinished = false
+// Configuration of S3 client
+const s3 = new S3({
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,  // Recommended to use environment variables
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+  },
+  region: "us-east-1", // Ensure you use the correct region
 });
 
-const s3 = new AWS.S3();
 
 const db = mysql.createConnection({
   host: process.env.MYSQL_HOST,
@@ -34,8 +38,6 @@ db.connect((error) => {
 let latestUpdatedTime;
 
 db.query('SELECT MAX(updated_date) AS LatestUpdate FROM latest_date', (error, results, fields) => {
-
-  console.log(results);
 
   if(results == undefined) {
     latestUpdatedTime = 0
@@ -184,6 +186,22 @@ async function saveDataHandle(element) {
           });
           for(const media of propertyItem.Media) {
             if(new Date(media['MediaModificationTimestamp']).getTime() < latestUpdatedTime) continue;
+
+            app.delete(`uploads/images/2024/${primaryKey}/`, async (req, res) => {
+              const key = req.body.key; // Assuming the filename is sent in the request body
+
+              const params = {
+                Bucket: process.env.AWS_S3_BUCKET_NAME,
+                Key: key
+              };
+
+              try {
+                await s3Client.send(new DeleteObjectCommand(params));
+                res.send({ message: 'File successfully deleted' });
+              } catch (err) {
+              }
+            });
+
             let uploadedUrl = await handleMediaUpload(media, primaryKey);
             for (let mediaKey of Object.keys(media)) {
               let mediaFieldId = mediaMetadataResults[mediaKey];
@@ -223,12 +241,13 @@ async function saveDataHandle(element) {
             });
           }
         }
+        nextLink = allProperty["@odata.nextLink"]
       }
     } else {
       let allProperty = await trestle
-      .get(element)
-      .query({$top: 2})
-      .catch((e) => console.log(e));
+        .get(`https://api-prod.corelogic.com/trestle/odata/${element}?&replication=true`)
+        .query()
+        .catch((e) => console.log(e));
 
       if (allProperty.value)
         allProperty.value.forEach((propertyItem) => {
@@ -276,9 +295,9 @@ async function saveDataHandle(element) {
           });
         });
     }
-    console.log("Success");
+    console.log(`${element} Success`);
   } catch {
-    console.log("failed");
+    console.log(`${element} failed`);
   }
 }
 
@@ -287,8 +306,9 @@ async function handleMediaUpload(media, primaryKey) {
     const response = await axios({
       url: media["MediaURL"],
       method: "GET",
-      responseType: "stream",
+      responseType: "stream"
     });
+
     const fileExtension = media["MediaType"];
     const s3Key = `uploads/images/2024/${primaryKey}/${media["MediaKey"].split('/').pop()}.${fileExtension}`;
 
@@ -298,11 +318,17 @@ async function handleMediaUpload(media, primaryKey) {
       Body: response.data,
     };
 
-    const uploadResult = await s3.upload(params).promise();
+    const parallelUploads3 = new Upload({
+      client: s3,
+      params: params
+    });
+
+    const uploadResult = await parallelUploads3.done();
     console.log("Upload successful:", uploadResult.Location);
     return uploadResult.Location;
   } catch (err) {
     console.error("Error during S3 upload:", err);
+    throw err;
   }
 }
 
@@ -391,21 +417,23 @@ async function createTables(schema) {
           const standardNameElement = enumValue.elements.find(element => element.attributes.Term === "RESO.OData.Metadata.StandardName");
 
           if (standardNameElement) {
-            const fieldName = enumValue.attributes.Name; // I'm assuming enumValue has a Name attribute representing the field
+            const fieldName = enumValue.attributes.Name;
             const value = standardNameElement.attributes.String; // Obtaining the standard name string
 
+            // Using placeholders (?) for parameters in the query
             let insertEnumDataQuery = `
-              INSERT INTO ${TableName} (Name, value)
-              SELECT '${escape(fieldName)}', '${escape(value)}'
-              WHERE NOT EXISTS (
-                SELECT 1 FROM ${TableName} WHERE Name = '${escape(fieldName)}'
-              );
+                INSERT INTO ${TableName} (Name, value)
+                SELECT ?, ? WHERE NOT EXISTS (
+                    SELECT 1 FROM ${TableName} WHERE Name = ?
+                );
             `;
 
-            db.query(insertEnumDataQuery, (err, result) => {
-              if (err) {
-                return;
-              }
+            // Execute query with parameters
+            db.query(insertEnumDataQuery, [fieldName, value, fieldName], (err, result) => {
+                if (err) {
+                    console.error("Error executing query:", err);
+                    return;
+                }
             });
           }
         }
@@ -453,11 +481,14 @@ async function fetchDataAndProcess() {
     "PropertyUnitTypes",
     // "Media",
   ];
-  await Promise.all(
-    elements.map(async (element) => {
-      await saveDataHandle(element);
-    })
-  );
+
+  for(const element of elements) {
+    await saveDataHandle(element);
+  }
+    // elements.map(async (element) => {
+    //   await saveDataHandle(element);
+    // })
+
 }
 
 function startScript () {
@@ -494,11 +525,20 @@ function startScript () {
 }
 
 // Schedule the tas k to run every 5 minutes
-cron.schedule('*/10 * * * *', () => {
-  startScript()
-});
-
 app.listen(3000, () => {
   console.log("Server running on http://localhost:3000");
-  startScript()
+  startScript(() => {
+    // Assuming startScript is asynchronous and calling back when done
+    isFinished = true;
+    checkAndStartCronJob();
+  });
 });
+
+function checkAndStartCronJob() {
+  if (isFinished) {
+    cron.schedule('*/20 * * * *', () => {
+      console.log("---------Update-------------");
+      startScript();
+    });
+  }
+}

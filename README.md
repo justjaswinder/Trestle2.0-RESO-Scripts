@@ -4,4 +4,4 @@ Develop a professional and comprehensive suite of Node.js scripts to automate th
 
 npm install
 
-npm start
+npm run start
