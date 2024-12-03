@@ -11,16 +11,15 @@ require("dotenv").config();
 
 const { S3 } = require("@aws-sdk/client-s3");
 
-let isFinished = false
+let isFinished = false;
 // Configuration of S3 client
 const s3 = new S3({
   credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID,  // Recommended to use environment variables
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID, // Recommended to use environment variables
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
   },
   region: "us-east-1", // Ensure you use the correct region
 });
-
 
 const db = mysql.createConnection({
   host: process.env.MYSQL_HOST,
@@ -37,14 +36,16 @@ db.connect((error) => {
 
 let latestUpdatedTime;
 
-db.query('SELECT MAX(updated_date) AS LatestUpdate FROM latest_date', (error, results, fields) => {
-
-  if(results == undefined) {
-    latestUpdatedTime = 0
-  } else {
-    latestUpdatedTime = new Date(results[0].LatestUpdate).getTime();
+db.query(
+  "SELECT MAX(updated_date) AS LatestUpdate FROM latest_date",
+  (error, results, fields) => {
+    if (results == undefined) {
+      latestUpdatedTime = 0;
+    } else {
+      latestUpdatedTime = new Date(results[0].LatestUpdate).getTime();
+    }
   }
-});
+);
 
 async function authenticate() {
   const trestleConfig = {
@@ -125,7 +126,6 @@ async function createMetaDataTable(metadata) {
 
 async function saveDataHandle(element) {
   try {
-
     const accessToken = await authenticate();
     const trestle = odata.o(process.env.API_URL, {
       headers: {
@@ -134,17 +134,19 @@ async function saveDataHandle(element) {
       fragment: "",
     });
 
-    if(element == "Property") {
+    if (element == "Property") {
       let allProperty = await trestle
-        .get("https://api-prod.corelogic.com/trestle/odata/Property?$expand=Media&replication=true")
+        .get(
+          "https://api-prod.corelogic.com/trestle/odata/Property?$expand=Media&replication=true"
+        )
         .query()
         .catch((e) => console.log(e));
 
-      let nextLink = allProperty["@odata.nextLink"]
+      let nextLink = allProperty["@odata.nextLink"];
 
       console.log("fetching data ...");
 
-      while(nextLink) {
+      while (nextLink) {
         if (!allProperty.value) return;
 
         allProperty = await trestle
@@ -152,64 +154,105 @@ async function saveDataHandle(element) {
           .query()
           .catch((e) => console.log(e));
         // Collect all unique property keys from all items
-        const allPropertyKeys = [...new Set(allProperty.value.flatMap(Object.keys))];
+        const allPropertyKeys = [
+          ...new Set(allProperty.value.flatMap(Object.keys)),
+        ];
 
         // Fetch all field IDs at once
-        const getFieldIdQuery = `SELECT id, field FROM ${element}_metadata WHERE field IN (${allPropertyKeys.map(key => `"${key}"`).join(', ')})`;
+        const getFieldIdQuery = `SELECT id, field FROM ${element}_metadata WHERE field IN (${allPropertyKeys
+          .map((key) => `"${key}"`)
+          .join(", ")})`;
         const metadataResults = await new Promise((resolve, reject) => {
           db.query(getFieldIdQuery, (err, result) => {
             if (err) return reject(err);
-            resolve(result.reduce((acc, item) => ({ ...acc, [item.field]: item.id }), {}));
+            resolve(
+              result.reduce(
+                (acc, item) => ({ ...acc, [item.field]: item.id }),
+                {}
+              )
+            );
           });
         });
 
         let bulkInsertValues = [];
-        let bulkInsertMedias = []
+        let bulkInsertMedias = [];
         for (const propertyItem of allProperty.value) {
           const primaryKey = propertyItem[`ListingKey`];
 
-          if(new Date(propertyItem['ModificationTimestamp']).getTime() < latestUpdatedTime) continue;
+          if (
+            new Date(propertyItem["ModificationTimestamp"]).getTime() <
+            latestUpdatedTime
+          )
+            continue;
           for (let propertyKey of Object.keys(propertyItem)) {
             let fieldId = metadataResults[propertyKey];
-            if (!fieldId || !propertyItem[propertyKey] || propertyKey == "Media") continue;
-            bulkInsertValues.push([primaryKey, fieldId, propertyItem[propertyKey]]);
+            if (
+              !fieldId ||
+              !propertyItem[propertyKey] ||
+              propertyKey == "Media"
+            )
+              continue;
+            bulkInsertValues.push([
+              primaryKey,
+              fieldId,
+              propertyItem[propertyKey],
+            ]);
           }
 
-          const allMediaKeys = [...new Set(propertyItem.Media.flatMap(Object.keys))];
+          const allMediaKeys = [
+            ...new Set(propertyItem.Media.flatMap(Object.keys)),
+          ];
 
-          const getMediaFieldIdQuery = `SELECT id, field FROM media_metadata WHERE field IN (${allMediaKeys.map(key => `"${key}"`).join(', ')})`;
+          const getMediaFieldIdQuery = `SELECT id, field FROM media_metadata WHERE field IN (${allMediaKeys
+            .map((key) => `"${key}"`)
+            .join(", ")})`;
           const mediaMetadataResults = await new Promise((resolve, reject) => {
             db.query(getMediaFieldIdQuery, (err, result) => {
               if (err) return reject(err);
-              resolve(result.reduce((acc, item) => ({ ...acc, [item.field]: item.id }), {}));
+              resolve(
+                result.reduce(
+                  (acc, item) => ({ ...acc, [item.field]: item.id }),
+                  {}
+                )
+              );
             });
           });
-          for(const media of propertyItem.Media) {
-            if(new Date(media['MediaModificationTimestamp']).getTime() < latestUpdatedTime) continue;
+          for (const media of propertyItem.Media) {
+            if (
+              new Date(media["MediaModificationTimestamp"]).getTime() <
+              latestUpdatedTime
+            )
+              continue;
 
-            app.delete(`uploads/images/2024/${primaryKey}/`, async (req, res) => {
-              const key = req.body.key; // Assuming the filename is sent in the request body
+            app.delete(
+              `uploads/images/2024/${primaryKey}/`,
+              async (req, res) => {
+                const key = req.body.key; // Assuming the filename is sent in the request body
 
-              const params = {
-                Bucket: process.env.AWS_S3_BUCKET_NAME,
-                Key: key
-              };
+                const params = {
+                  Bucket: process.env.AWS_S3_BUCKET_NAME,
+                  Key: key,
+                };
 
-              try {
-                await s3Client.send(new DeleteObjectCommand(params));
-                res.send({ message: 'File successfully deleted' });
-              } catch (err) {
+                try {
+                  await s3Client.send(new DeleteObjectCommand(params));
+                  res.send({ message: "File successfully deleted" });
+                } catch (err) {}
               }
-            });
+            );
 
             let uploadedUrl = await handleMediaUpload(media, primaryKey);
             for (let mediaKey of Object.keys(media)) {
               let mediaFieldId = mediaMetadataResults[mediaKey];
-              if(media[mediaKey] == null) continue;
-              if(mediaKey == "MediaURL") {
-                bulkInsertMedias.push([primaryKey, mediaFieldId, uploadedUrl])
+              if (media[mediaKey] == null) continue;
+              if (mediaKey == "MediaURL") {
+                bulkInsertMedias.push([primaryKey, mediaFieldId, uploadedUrl]);
               } else {
-                bulkInsertMedias.push([primaryKey, mediaFieldId, media[mediaKey]])
+                bulkInsertMedias.push([
+                  primaryKey,
+                  mediaFieldId,
+                  media[mediaKey],
+                ]);
               }
             }
             let insertMediaQuery = `
@@ -220,9 +263,11 @@ async function saveDataHandle(element) {
                     WHEN primary_key != VALUES(primary_key) THEN VALUES(value)
                     ELSE value
                   END;
-            `
+            `;
             await new Promise((resolve, reject) => {
-              db.query(insertMediaQuery, [bulkInsertMedias], (err, result) => err ? reject(err) : resolve(result));
+              db.query(insertMediaQuery, [bulkInsertMedias], (err, result) =>
+                err ? reject(err) : resolve(result)
+              );
             });
           }
 
@@ -237,15 +282,19 @@ async function saveDataHandle(element) {
                 END;
             `;
             await new Promise((resolve, reject) => {
-              db.query(insertQuery, [bulkInsertValues], (err, result) => err ? reject(err) : resolve(result));
+              db.query(insertQuery, [bulkInsertValues], (err, result) =>
+                err ? reject(err) : resolve(result)
+              );
             });
           }
         }
-        nextLink = allProperty["@odata.nextLink"]
+        nextLink = allProperty["@odata.nextLink"];
       }
     } else {
       let allProperty = await trestle
-        .get(`https://api-prod.corelogic.com/trestle/odata/${element}?&replication=true`)
+        .get(
+          `https://api-prod.corelogic.com/trestle/odata/${element}?&replication=true`
+        )
         .query()
         .catch((e) => console.log(e));
 
@@ -290,7 +339,6 @@ async function saveDataHandle(element) {
                   return;
                 }
               });
-
             });
           });
         });
@@ -306,11 +354,13 @@ async function handleMediaUpload(media, primaryKey) {
     const response = await axios({
       url: media["MediaURL"],
       method: "GET",
-      responseType: "stream"
+      responseType: "stream",
     });
 
     const fileExtension = media["MediaType"];
-    const s3Key = `uploads/images/2024/${primaryKey}/${media["MediaKey"].split('/').pop()}.${fileExtension}`;
+    const s3Key = `uploads/images/2024/${primaryKey}/${media["MediaKey"]
+      .split("/")
+      .pop()}.${fileExtension}`;
 
     const params = {
       Bucket: process.env.AWS_S3_BUCKET_NAME,
@@ -320,7 +370,7 @@ async function handleMediaUpload(media, primaryKey) {
 
     const parallelUploads3 = new Upload({
       client: s3,
-      params: params
+      params: params,
     });
 
     const uploadResult = await parallelUploads3.done();
@@ -377,44 +427,62 @@ async function createTables(schema) {
       metadata.elements.forEach((field) => {
         createMetaData(metaDataTableName, field);
       });
-    }
-    else if (schema.attributes.Namespace === "CoreLogic.DataStandard.RESO.WebAPI") {
+    } else if (
+      schema.attributes.Namespace === "CoreLogic.DataStandard.RESO.WebAPI"
+    ) {
       const TableName = `\`${metadata.attributes.Name.replace(/\./g, "_")}\``;
 
       let columns = [];
-      const promises = metadata.elements.map(column => {  // Using map to convert each item to a promise
-          return new Promise((resolve, reject) => {  // Encapsulating the processing of each column in a promise
-            if (column.name === "Property") {
-              let relation = relations.find(item => item.edm === column.attributes.Type);
+      const promises = metadata.elements.map((column) => {
+        // Using map to convert each item to a promise
+        return new Promise((resolve, reject) => {
+          // Encapsulating the processing of each column in a promise
+          if (column.name === "Property") {
+            let relation = relations.find(
+              (item) => item.edm === column.attributes.Type
+            );
 
-              columns.push(`${column.attributes.Name} ${relation ? relation.sql : 'TEXT'}`);
-            }
-            resolve();  // Resolving the promise after processing each column
-          });
+            columns.push(
+              `${column.attributes.Name} ${relation ? relation.sql : "TEXT"}`
+            );
+          }
+          resolve(); // Resolving the promise after processing each column
+        });
       });
 
       Promise.all(promises)
         .then(() => {
-          let createTableQuery = `CREATE TABLE IF NOT EXISTS  ${TableName} (${columns.join(", ")})
-            `
+          let createTableQuery = `CREATE TABLE IF NOT EXISTS  ${TableName} (${columns.join(
+            ", "
+          )})
+            `;
           db.query(createTableQuery, (err, result) => {
             if (err) throw err; // Handling error
-          })
+          });
         })
-        .catch(error => {
-          console.error('There was an error processing the columns:', error);
-      });
-    }
-    else if(schema.attributes.Namespace === "CoreLogic.DataStandard.RESO.DD.Enums" || schema.attributes.Namespace === "CoreLogic.DataStandard.RESO.DD.Enums.Multi") {
+        .catch((error) => {
+          console.error("There was an error processing the columns:", error);
+        });
+    } else if (
+      schema.attributes.Namespace === "CoreLogic.DataStandard.RESO.DD.Enums" ||
+      schema.attributes.Namespace ===
+        "CoreLogic.DataStandard.RESO.DD.Enums.Multi"
+    ) {
       const TableName = `\`${metadata.attributes.Name.replace(/\./g, "_")}\``;
 
-      db.query(`CREATE TABLE IF NOT EXISTS ${TableName} (id INT AUTO_INCREMENT PRIMARY KEY, Name TEXT, Value TEXT, Description TEXT)`, (err, result) => {
-        if (err) throw err; // Handling error
-      })
+      db.query(
+        `CREATE TABLE IF NOT EXISTS ${TableName} (id INT AUTO_INCREMENT PRIMARY KEY, Name TEXT, Value TEXT, Description TEXT)`,
+        (err, result) => {
+          if (err) throw err; // Handling error
+        }
+      );
 
-      metadata.elements.forEach(enumValue => {
-        if(enumValue.elements) {
-          const standardNameElement = enumValue.elements.find(element => element.attributes.Term === "RESO.OData.Metadata.StandardName");
+      metadata.elements.forEach((enumValue) => {
+        if (enumValue.elements) {
+          const standardNameElement = enumValue.elements.find(
+            (element) =>
+              element.attributes.Term === "RESO.OData.Metadata.StandardName"
+          );
 
           if (standardNameElement) {
             const fieldName = enumValue.attributes.Name;
@@ -429,18 +497,20 @@ async function createTables(schema) {
             `;
 
             // Execute query with parameters
-            db.query(insertEnumDataQuery, [fieldName, value, fieldName], (err, result) => {
+            db.query(
+              insertEnumDataQuery,
+              [fieldName, value, fieldName],
+              (err, result) => {
                 if (err) {
-                    console.error("Error executing query:", err);
-                    return;
+                  console.error("Error executing query:", err);
+                  return;
                 }
-            });
+              }
+            );
           }
         }
-
       });
-    }
-    else {
+    } else {
       return false;
     }
   });
@@ -482,46 +552,51 @@ async function fetchDataAndProcess() {
     // "Media",
   ];
 
-  for(const element of elements) {
+  for (const element of elements) {
     await saveDataHandle(element);
   }
-    // elements.map(async (element) => {
-    //   await saveDataHandle(element);
-    // })
-
+  // elements.map(async (element) => {
+  //   await saveDataHandle(element);
+  // })
 }
 
-function startScript () {
-  fetchDataAndProcess();
-  latestUpdatedTime =new Date()
+async function startScript() {
+  await fetchDataAndProcess();
+  latestUpdatedTime = new Date();
 
   // Format date to MySQL DATETIME format
-  const mysqlDateTime = latestUpdatedTime.toISOString().slice(0, 19).replace('T', ' ');
+  const mysqlDateTime = latestUpdatedTime
+    .toISOString()
+    .slice(0, 19)
+    .replace("T", " ");
 
   let LatestUpdatedDateDBCreationQuery = `
     CREATE TABLE IF NOT EXISTS \`latest_date\` (
       id INT AUTO_INCREMENT PRIMARY KEY,
       updated_date DATETIME
     );
-  `
+  `;
   db.query(LatestUpdatedDateDBCreationQuery, (err, result) => {
     if (err) throw err;
   });
 
-  db.query('SELECT * FROM `latest_date` WHERE `id` = "1"', function (error, results, fields) {
-    if (results.length !== 0) {
-      var sql = `UPDATE latest_date SET updated_date = ? WHERE id = 1`;
-      var params = [mysqlDateTime];  // Parameters used in the SQL query
-    } else {
+  db.query(
+    'SELECT * FROM `latest_date` WHERE `id` = "1"',
+    function (error, results, fields) {
+      if (results.length !== 0) {
+        var sql = `UPDATE latest_date SET updated_date = ? WHERE id = 1`;
+        var params = [mysqlDateTime]; // Parameters used in the SQL query
+      } else {
         var sql = `INSERT INTO latest_date (updated_date) VALUES (?)`;
         var params = [mysqlDateTime];
-    }
+      }
 
-    // Use these in your query call
-    db.query(sql, params, (err, result) => {
+      // Use these in your query call
+      db.query(sql, params, (err, result) => {
         if (err) throw err;
-    });
-  });
+      });
+    }
+  );
 }
 
 // Schedule the tas k to run every 5 minutes
@@ -536,7 +611,7 @@ app.listen(3000, () => {
 
 function checkAndStartCronJob() {
   if (isFinished) {
-    cron.schedule('*/20 * * * *', () => {
+    cron.schedule("*/20 * * * *", () => {
       console.log("---------Update-------------");
       startScript();
     });
