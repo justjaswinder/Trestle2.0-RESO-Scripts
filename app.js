@@ -7,7 +7,11 @@ const mysql = require("mysql");
 const odata = require("odata");
 const xmljs = require("xml-js");
 const { Upload } = require("@aws-sdk/lib-storage");
+const fs = require("fs");
+const path = require("path");
 require("dotenv").config();
+
+// Initialize axios-retry
 
 const { S3 } = require("@aws-sdk/client-s3");
 
@@ -87,12 +91,12 @@ function createMetaData(metaDataTableName, field) {
       insertingData = `'${field.attributes.Name}', 'ENUM'`;
     }
     const insertMetaDataQuery = `
-      INSERT INTO ${metaDataTableName} (field, type)
+      INSERT INTO ${metaDataTableName.toLowerCase()} (field, type)
       SELECT '${field.attributes.Name}', '${relation ? relation.sql : "ENUM"}'
       FROM dual
       WHERE NOT EXISTS (
           SELECT 1
-          FROM ${metaDataTableName}
+          FROM ${metaDataTableName.toLowerCase()}
           WHERE field = '${field.attributes.Name}'
       );
     `;
@@ -111,8 +115,8 @@ async function createMetaDataTable(metadata) {
       parsedData.elements[0].elements &&
       parsedData.elements[0].elements[0].elements
     ) {
-      parsedData.elements[0].elements[0].elements.forEach((schema) => {
-        createTables(schema);
+      parsedData.elements[0].elements[0].elements.forEach(async (schema) => {
+        await createTables(schema);
       });
     } else {
       console.log(
@@ -126,40 +130,35 @@ async function createMetaDataTable(metadata) {
 
 async function saveDataHandle(element) {
   try {
-    const accessToken = await authenticate();
-    const trestle = odata.o(process.env.API_URL, {
-      headers: {
-        Authorization: "Bearer " + accessToken.token.access_token,
-      },
-      fragment: "",
-    });
-
     if (element == "Property") {
-      let allProperty = await trestle
-        .get(
-          "https://api-prod.corelogic.com/trestle/odata/Property?$expand=Media&replication=true"
-        )
-        .query()
-        .catch((e) => console.log(e));
-
-      let nextLink = allProperty["@odata.nextLink"];
+      let nextLink =
+        "https://api-prod.corelogic.com/trestle/odata/Property?$expand=Media";
 
       console.log("fetching data ...");
 
       while (nextLink) {
-        if (!allProperty.value) return;
+        const accessToken = await authenticate();
+        const trestle = odata.o(process.env.API_URL, {
+          headers: {
+            Authorization: "Bearer " + accessToken.token.access_token,
+          },
+          fragment: "",
+        });
 
-        allProperty = await trestle
+        let property = await trestle
           .get(nextLink)
           .query()
           .catch((e) => console.log(e));
+
         // Collect all unique property keys from all items
+        nextLink = property["@odata.nextLink"];
+
         const allPropertyKeys = [
-          ...new Set(allProperty.value.flatMap(Object.keys)),
+          ...new Set(property.value.flatMap(Object.keys)),
         ];
 
         // Fetch all field IDs at once
-        const getFieldIdQuery = `SELECT id, field FROM ${element}_metadata WHERE field IN (${allPropertyKeys
+        const getFieldIdQuery = `SELECT id, field FROM ${element.toLowerCase()}_metadata WHERE field IN (${allPropertyKeys
           .map((key) => `"${key}"`)
           .join(", ")})`;
         const metadataResults = await new Promise((resolve, reject) => {
@@ -173,17 +172,21 @@ async function saveDataHandle(element) {
             );
           });
         });
-
         let bulkInsertValues = [];
         let bulkInsertMedias = [];
-        for (const propertyItem of allProperty.value) {
-          const primaryKey = propertyItem[`ListingKey`];
+        for (let propertyItem of property.value) {
+          let primaryKey = propertyItem[`ListingKey`];
 
           if (
             new Date(propertyItem["ModificationTimestamp"]).getTime() <
             latestUpdatedTime
           )
             continue;
+
+          let allMediaKeys = [
+            ...new Set(propertyItem.Media.flatMap(Object.keys)),
+          ];
+
           for (let propertyKey of Object.keys(propertyItem)) {
             let fieldId = metadataResults[propertyKey];
             if (
@@ -199,81 +202,86 @@ async function saveDataHandle(element) {
             ]);
           }
 
-          const allMediaKeys = [
-            ...new Set(propertyItem.Media.flatMap(Object.keys)),
-          ];
+          if (allMediaKeys.length != 0) {
+            const getMediaFieldIdQuery = `SELECT id, field FROM media_metadata WHERE field IN (${allMediaKeys
+              .map((key) => `"${key}"`)
+              .join(", ")})`;
 
-          const getMediaFieldIdQuery = `SELECT id, field FROM media_metadata WHERE field IN (${allMediaKeys
-            .map((key) => `"${key}"`)
-            .join(", ")})`;
-          const mediaMetadataResults = await new Promise((resolve, reject) => {
-            db.query(getMediaFieldIdQuery, (err, result) => {
-              if (err) return reject(err);
-              resolve(
-                result.reduce(
-                  (acc, item) => ({ ...acc, [item.field]: item.id }),
-                  {}
-                )
-              );
-            });
-          });
-          for (const media of propertyItem.Media) {
-            if (
-              new Date(media["MediaModificationTimestamp"]).getTime() <
-              latestUpdatedTime
-            )
-              continue;
-
-            app.delete(
-              `uploads/images/2024/${primaryKey}/`,
-              async (req, res) => {
-                const key = req.body.key; // Assuming the filename is sent in the request body
-
-                const params = {
-                  Bucket: process.env.AWS_S3_BUCKET_NAME,
-                  Key: key,
-                };
-
-                try {
-                  await s3Client.send(new DeleteObjectCommand(params));
-                  res.send({ message: "File successfully deleted" });
-                } catch (err) {}
+            const mediaMetadataResults = await new Promise(
+              (resolve, reject) => {
+                db.query(getMediaFieldIdQuery, (err, result) => {
+                  if (err) return reject(err);
+                  resolve(
+                    result.reduce(
+                      (acc, item) => ({ ...acc, [item.field]: item.id }),
+                      {}
+                    )
+                  );
+                });
               }
             );
+            for (let media of propertyItem.Media) {
+              if (
+                new Date(media["MediaModificationTimestamp"]).getTime() <
+                latestUpdatedTime
+              )
+                continue;
 
-            let uploadedUrl = await handleMediaUpload(media, primaryKey);
-            for (let mediaKey of Object.keys(media)) {
-              let mediaFieldId = mediaMetadataResults[mediaKey];
-              if (media[mediaKey] == null) continue;
-              if (mediaKey == "MediaURL") {
-                bulkInsertMedias.push([primaryKey, mediaFieldId, uploadedUrl]);
-              } else {
-                bulkInsertMedias.push([
-                  primaryKey,
-                  mediaFieldId,
-                  media[mediaKey],
-                ]);
-              }
-            }
-            let insertMediaQuery = `
-              INSERT INTO media (primary_key, field_id, value)
-                VALUES ?
-                ON DUPLICATE KEY UPDATE
-                  value = CASE
-                    WHEN primary_key != VALUES(primary_key) THEN VALUES(value)
-                    ELSE value
-                  END;
-            `;
-            await new Promise((resolve, reject) => {
-              db.query(insertMediaQuery, [bulkInsertMedias], (err, result) =>
-                err ? reject(err) : resolve(result)
+              app.delete(
+                `uploads/images/2024/${primaryKey}/`,
+                async (req, res) => {
+                  const key = req.body.key; // Assuming the filename is sent in the request body
+
+                  const params = {
+                    Bucket: process.env.AWS_S3_BUCKET_NAME,
+                    Key: key,
+                  };
+
+                  try {
+                    await s3Client.send(new DeleteObjectCommand(params));
+                    res.send({ message: "File successfully deleted" });
+                  } catch (err) {}
+                }
               );
-            });
+              let uploadedUrl = await handleMediaUpload(media, primaryKey);
+              for (let mediaKey of Object.keys(media)) {
+                let mediaFieldId = mediaMetadataResults[mediaKey];
+                if (media[mediaKey] == null) continue;
+                if (mediaKey == "MediaURL") {
+                  bulkInsertMedias.push([
+                    media["MediaKey"],
+                    mediaFieldId,
+                    uploadedUrl,
+                  ]);
+                } else {
+                  bulkInsertMedias.push([
+                    media["MediaKey"],
+                    mediaFieldId,
+                    media[mediaKey],
+                  ]);
+                }
+              }
+              let insertMediaQuery = `
+                INSERT INTO media (primary_key, field_id, value)
+                  VALUES ?
+                  ON DUPLICATE KEY UPDATE
+                    value = CASE
+                      WHEN primary_key != VALUES(primary_key) THEN VALUES(value)
+                      ELSE value
+                    END;
+              `;
+              await new Promise((resolve, reject) => {
+                db.query(insertMediaQuery, [bulkInsertMedias], (err, result) =>
+                  err ? reject(err) : resolve(result)
+                );
+              });
+              bulkInsertMedias = [];
+            }
           }
 
           if (bulkInsertValues.length > 0) {
             const insertQuery = `
-              INSERT INTO ${element} (primary_key, field_id, value)
+              INSERT INTO ${element.toLowerCase()} (primary_key, field_id, value)
               VALUES ?
               ON DUPLICATE KEY UPDATE
                 value = CASE
@@ -286,11 +294,18 @@ async function saveDataHandle(element) {
                 err ? reject(err) : resolve(result)
               );
             });
+            bulkInsertValues = [];
           }
         }
-        nextLink = allProperty["@odata.nextLink"];
       }
     } else {
+      const accessToken = await authenticate();
+      const trestle = odata.o(process.env.API_URL, {
+        headers: {
+          Authorization: "Bearer " + accessToken.token.access_token,
+        },
+        fragment: "",
+      });
       let allProperty = await trestle
         .get(
           `https://api-prod.corelogic.com/trestle/odata/${element}?&replication=true`
@@ -303,11 +318,10 @@ async function saveDataHandle(element) {
           const propertyKeys = Object.keys(propertyItem);
 
           propertyKeys.forEach((propertyKey) => {
-            let getFieldIdQuery = `SELECT id FROM ${element}_metadata WHERE field = "${propertyKey}"`;
+            let getFieldIdQuery = `SELECT id FROM ${element.toLowerCase()}_metadata WHERE field = "${propertyKey}"`;
 
             db.query(getFieldIdQuery, (err, result) => {
               if (err) {
-                console.log(err);
                 return;
               }
 
@@ -322,7 +336,7 @@ async function saveDataHandle(element) {
               }
 
               const insertOrUpdatePropertyData = `
-                INSERT INTO ${element} (primary_key, field_id, value)
+                INSERT INTO ${element.toLowerCase()} (primary_key, field_id, value)
                 VALUES (?, ?, ?)
                 ON DUPLICATE KEY UPDATE
                   value = CASE
@@ -344,7 +358,7 @@ async function saveDataHandle(element) {
         });
     }
     console.log(`${element} Success`);
-  } catch {
+  } catch (err) {
     console.log(`${element} failed`);
   }
 }
@@ -377,38 +391,40 @@ async function handleMediaUpload(media, primaryKey) {
     console.log("Upload successful:", uploadResult.Location);
     return uploadResult.Location;
   } catch (err) {
-    console.error("Error during S3 upload:", err);
-    throw err;
+    return false;
   }
 }
 
 async function createTables(schema) {
   schema.elements.forEach((metadata) => {
     if (schema.attributes.Namespace == "CoreLogic.DataStandard.RESO.DD") {
-      const TableName = `\`${metadata.attributes.Name.replace(/\./g, "_")}\``;
+      const TableName = `\`${metadata.attributes.Name.replace(
+        /\./g,
+        "_"
+      )}\``.toLowerCase();
       const metaDataTableName = `\`${metadata.attributes.Name.replace(
         /\./g,
         "_"
-      )}_metadata\``;
+      )}_metadata\``.toLowerCase();
 
       let createMetaDataQuery = `
-        CREATE TABLE IF NOT EXISTS ${metaDataTableName} (
+        CREATE TABLE IF NOT EXISTS ${metaDataTableName.toLowerCase()} (
           id INT AUTO_INCREMENT PRIMARY KEY,
-          field VARCHAR(100),
-          type VARCHAR(100),
-          description VARCHAR(250),
+          field TEXT,
+          type TEXT,
+          description TEXT,
           is_primary BOOLEAN,
           is_deleted BOOLEAN
         )
       `;
 
       let createTableQuery = `
-        CREATE TABLE IF NOT EXISTS ${TableName} (
+        CREATE TABLE IF NOT EXISTS ${TableName.toLowerCase()} (
           id INT AUTO_INCREMENT PRIMARY KEY,
-          primary_key VARCHAR(100),
+          primary_key TEXT,
           field_id INT,
-          value VARCHAR(250),
-          FOREIGN KEY (field_id) REFERENCES ${metaDataTableName}(id),
+          value TEXT,
+          FOREIGN KEY (field_id) REFERENCES ${metaDataTableName.toLowerCase()}(id),
           is_deleted BOOLEAN,
           is_updated BOOLEAN
         );
@@ -452,7 +468,7 @@ async function createTables(schema) {
 
       Promise.all(promises)
         .then(() => {
-          let createTableQuery = `CREATE TABLE IF NOT EXISTS  ${TableName} (${columns.join(
+          let createTableQuery = `CREATE TABLE IF NOT EXISTS  ${TableName.toLowerCase()} (${columns.join(
             ", "
           )})
             `;
@@ -471,7 +487,7 @@ async function createTables(schema) {
       const TableName = `\`${metadata.attributes.Name.replace(/\./g, "_")}\``;
 
       db.query(
-        `CREATE TABLE IF NOT EXISTS ${TableName} (id INT AUTO_INCREMENT PRIMARY KEY, Name TEXT, Value TEXT, Description TEXT)`,
+        `CREATE TABLE IF NOT EXISTS ${TableName.toLowerCase()} (id INT AUTO_INCREMENT PRIMARY KEY, Name TEXT, Value TEXT, Description TEXT)`,
         (err, result) => {
           if (err) throw err; // Handling error
         }
@@ -490,9 +506,9 @@ async function createTables(schema) {
 
             // Using placeholders (?) for parameters in the query
             let insertEnumDataQuery = `
-                INSERT INTO ${TableName} (Name, value)
+                INSERT INTO ${TableName.toLowerCase()} (Name, value)
                 SELECT ?, ? WHERE NOT EXISTS (
-                    SELECT 1 FROM ${TableName} WHERE Name = ?
+                    SELECT 1 FROM ${TableName.toLowerCase()} WHERE Name = ?
                 );
             `;
 
@@ -540,6 +556,7 @@ async function fetchDataAndProcess() {
   // Fetch data and save the data
   const elements = [
     "Property",
+    // "Media",
     "Member",
     "Teams",
     "TeamMembers",
@@ -549,7 +566,6 @@ async function fetchDataAndProcess() {
     "OpenHouse",
     "PropertyRooms",
     "PropertyUnitTypes",
-    // "Media",
   ];
 
   for (const element of elements) {
@@ -602,6 +618,7 @@ async function startScript() {
 // Schedule the tas k to run every 5 minutes
 app.listen(3000, () => {
   console.log("Server running on http://localhost:3000");
+  console.log("This is version 2.1.1 project for trestle");
   startScript(() => {
     // Assuming startScript is asynchronous and calling back when done
     isFinished = true;
@@ -612,7 +629,7 @@ app.listen(3000, () => {
 function checkAndStartCronJob() {
   if (isFinished) {
     cron.schedule("*/20 * * * *", () => {
-      console.log("---------Update-------------");
+      console.log("---------Start Updating-------------");
       startScript();
     });
   }
