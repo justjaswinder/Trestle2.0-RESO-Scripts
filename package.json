@@ -1,0 +1,29 @@
+{
+  "name": "trestleintegration-2.1.1",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node ./app.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.699.0",
+    "@aws-sdk/client-s3": "^3.700.0",
+    "@aws-sdk/lib-storage": "^3.700.0",
+    "axios": "^1.7.7",
+    "axios-retry": "^4.5.0",
+    "cookie-parser": "~1.4.4",
+    "debug": "~2.6.9",
+    "dotenv": "^16.4.5",
+    "express": "~4.16.1",
+    "http-errors": "~1.6.3",
+    "jade": "~1.11.0",
+    "log4js": "^6.9.1",
+    "morgan": "~1.9.1",
+    "multer": "^1.4.5-lts.1",
+    "mysql": "^2.18.1",
+    "node-cron": "^3.0.3",
+    "odata": "^2.0.1",
+    "simple-oauth2": "^5.1.0",
+    "xml-js": "^1.6.11"
+  }
+}
